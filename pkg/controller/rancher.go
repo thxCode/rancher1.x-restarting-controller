@@ -2,25 +2,28 @@ package controller
 
 import (
 	"bytes"
+	"encoding/base64"
+	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
-	"strconv"
-	"sync"
+	"strings"
 	"time"
 
 	"github.com/buger/jsonparser"
+	"github.com/gorilla/websocket"
 	"github.com/thxcode/rancher1.x-restarting-controller/pkg/utils"
 )
 
-type rancherClient struct {
+type httpClient struct {
 	client *http.Client
 
 	cattleAK string
 	cattleSK string
 }
 
-func (r *rancherClient) get(url string) ([]byte, error) {
+func (r *httpClient) get(url string) ([]byte, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -40,7 +43,7 @@ func (r *rancherClient) get(url string) ([]byte, error) {
 	}
 }
 
-func (r *rancherClient) post(url string, body io.Reader) (int, error) {
+func (r *httpClient) post(url string, body io.Reader) (int, error) {
 	req, err := http.NewRequest("POST", url, body)
 	if err != nil {
 		return 0, err
@@ -56,205 +59,185 @@ func (r *rancherClient) post(url string, body io.Reader) (int, error) {
 	return resp.StatusCode, nil
 }
 
-func newRancherClient(cattleAccessKey, cattleSecretKey string) *rancherClient {
-	return &rancherClient{
-		&http.Client{Timeout: 60 * time.Second},
+func newHttpClient(cattleAccessKey, cattleSecretKey string, timeoutSecond time.Duration) *httpClient {
+	return &httpClient{
+		&http.Client{Timeout: timeoutSecond},
 		cattleAccessKey,
 		cattleSecretKey,
 	}
 }
 
-type restartingContainer struct {
-	pid               int64
-	restartCount      int64
-	restartCountLimit int64
-	deactivateActions []string
-}
+func newWebsocketConn(cattleAddress, cattleAccessKey, cattleSecretKey string) *websocket.Conn {
+	// get dialer address
+	hc := newHttpClient(cattleAccessKey, cattleSecretKey, 5*time.Second)
 
-func (rc *restartingContainer) shouldBeStopped(newPid int64) bool {
-	if rc.pid != newPid {
-		rc.pid = newPid
+	projectsResponseBytes, err := hc.get(cattleAddress + "/projects")
+	if err != nil {
+		panic(errors.New(fmt.Sprintf("cannot get project info, %v", err)))
+	}
+	projectLinksSelf, err := jsonparser.GetString(projectsResponseBytes, "data", "[0]", "links", "self")
+	if err != nil {
+		panic(errors.New(fmt.Sprintf("cannot get project self address, %v", err)))
+	}
+	if strings.HasPrefix(projectLinksSelf, "http://") {
+		projectLinksSelf = strings.Replace(projectLinksSelf, "http://", "ws://", -1)
+	} else {
+		projectLinksSelf = strings.Replace(projectLinksSelf, "https://", "wss://", -1)
+	}
+	dialAddress := projectLinksSelf + "/subscribe?eventNames=resource.change&limit=-1&sockId=1"
 
-		rc.restartCount += 1
+	httpHeaders := http.Header{}
+	httpHeaders.Add("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(cattleAccessKey+":"+cattleSecretKey)))
+	websocketConn, _, err := websocket.DefaultDialer.Dial(dialAddress, httpHeaders)
+	if err != nil {
+		panic(err)
 	}
 
-	return rc.restartCount > rc.restartCountLimit
+	return websocketConn
 }
 
-func (rc *restartingContainer) stop(r *rancherClient) {
-	for _, deactivateAction := range rc.deactivateActions {
-		r.post(deactivateAction, bytes.NewBufferString("{}"))
+type log struct {
+	id string
+	op int
+}
+
+type daily struct {
+	limit    int
+	logChan  chan log
+	stopChan chan interface{}
+}
+
+func (d *daily) close() {
+	close(d.logChan)
+	close(d.stopChan)
+}
+
+func (d *daily) record(dockerId string) {
+	d.logChan <- log{
+		dockerId,
+		1,
 	}
 }
 
-var (
-	mutex                  = &sync.Mutex{}
-	stopChan               = make(chan interface{}, 1)
-	restartingContainerMap = map[string]*restartingContainer{}
-)
-
-func Start(cattleAddress, cattleAccessKey, cattleSecretKey, watchLabel string) error {
+func newDaily(cattleAddress, cattleAccessKey, cattleSecretKey string, limit int, intolerableInterval time.Duration) *daily {
 	glog := utils.GetGlobalLogger()
-	rc := newRancherClient(cattleAccessKey, cattleSecretKey)
 
-	glog.Infoln("scraping cattle labels...")
-	for {
-		select {
-		case <-stopChan:
-			break
-		default:
-			mutex.Lock()
+	d := &daily{
+		limit,
+		make(chan log, 10),
+		make(chan interface{}),
+	}
 
-			// scrap labels
-			labelsScrapAddress := cattleAddress + "/labels?limit=100&key=" + watchLabel
+	go func() {
+		logMap := make(map[string]int, 32)
+
+		go func() {
+			ticker := time.NewTicker(intolerableInterval)
+			defer ticker.Stop()
+
 			for {
-				glog.Debugln("<start> get labels:", labelsScrapAddress)
-				labelsBytes, err := rc.get(labelsScrapAddress)
-				if err != nil {
-					glog.Warnln(err)
-					break
-				}
-
-				// iterate labels
-				jsonparser.ArrayEach(labelsBytes, func(labelBytes []byte, dataType jsonparser.ValueType, offset int, labelErr error) {
-					labelValueString, err := jsonparser.GetString(labelBytes, "value") // restartCount
-					if err != nil {
-						glog.Warnln(err)
-						return
-					}
-
-					labelValue, err := strconv.ParseInt(labelValueString, 10, 0)
-					if err != nil {
-						glog.Warnln(err)
-						return
-					}
-					// scrap instances by label
-					instancesScrapAddress, err := jsonparser.GetString(labelBytes, "links", "instances")
-					if err != nil {
-						glog.Warnln(err)
-						return
-					}
-					instancesScrapAddress += "?limit=100&kind=container&allocationState=active"
-					for {
-						glog.Debugln("<start> get instances:", labelsScrapAddress)
-						instancesBytes, err := rc.get(instancesScrapAddress)
-						if err != nil {
-							glog.Warnln(err)
-							return
-						}
-
-						// iterate instances
-						jsonparser.ArrayEach(instancesBytes, func(instanceBytes []byte, dataType jsonparser.ValueType, offset int, instanceErr error) {
-							if instanceType, err := jsonparser.GetString(instanceBytes, "type"); err != nil {
-								glog.Warnln(err)
-								return
-							} else if instanceType != "container" {
-								return
-							}
-
-							if instanceAllocationState, err := jsonparser.GetString(instanceBytes, "allocationState"); err != nil {
-								glog.Warnln(err)
-								return
-							} else if instanceAllocationState != "active" {
-								return
-							}
-
-							containerId, err := jsonparser.GetString(instanceBytes, "id") // unexpected containerId
-							if err != nil {
-								glog.Warnln(err)
-								return
-							}
-
-							pid, err := jsonparser.GetInt(instanceBytes, "data", "dockerInspect", "State", "Pid")
-							if err != nil {
-								glog.Warnln(err)
-								return
-							}
-
-							if c, ok := restartingContainerMap[containerId]; !ok {
-								var deactivateActions []string
-								// scrap services by instance
-								servicesScrapAddress, err := jsonparser.GetString(instanceBytes, "links", "services")
-								if err != nil {
-									glog.Warnln(err)
-									return
-								}
-								servicesScrapAddress += "?limit=100"
-								for {
-									glog.Debugln("<start> get services:", servicesScrapAddress)
-									servicesBytes, err := rc.get(servicesScrapAddress)
-									if err != nil {
-										glog.Warnln(err)
-										return
-									}
-
-									// iterate services
-									jsonparser.ArrayEach(servicesBytes, func(serviceBytes []byte, dataType jsonparser.ValueType, offset int, serviceErr error) {
-										if serviceState, err := jsonparser.GetString(serviceBytes, "state"); err != nil {
-											glog.Warnln(err)
-											return
-										} else if serviceState == "inactive" {
-											return
-										}
-
-										if serviceHealthState, err := jsonparser.GetString(serviceBytes, "healthState"); err != nil {
-											glog.Warnln(err)
-											return
-										} else if serviceHealthState == "healthy" {
-											return
-										}
-
-										if deactivateAction, err := jsonparser.GetString(serviceBytes, "actions", "deactivate"); err != nil && err != jsonparser.KeyPathNotFoundError {
-											glog.Warnln(err)
-											return
-										} else if deactivateAction != "" {
-											deactivateActions = append(deactivateActions, deactivateAction)
-										}
-
-									}, "data")
-
-									if next, _ := jsonparser.GetString(servicesBytes, "pagination", "next"); next != "" {
-										servicesScrapAddress = next
-									} else {
-										glog.Debugln("<end> get services:", servicesScrapAddress)
-										break
-									}
-								}
-
-								if len(deactivateActions) != 0 {
-									restartingContainerMap[containerId] = &restartingContainer{
-										pid,
-										0,
-										labelValue,
-										deactivateActions,
-									}
-								}
-							} else if c.shouldBeStopped(pid) {
-								glog.Infoln("going to stop container", containerId)
-								c.stop(rc)
-								delete(restartingContainerMap, containerId)
-							}
-						}, "data")
-
-						if next, _ := jsonparser.GetString(instancesBytes, "pagination", "next"); next != "" {
-							instancesScrapAddress = next
-						} else {
-							glog.Debugln("<end> get instances:", instancesScrapAddress)
-							break
+				select {
+				case <-ticker.C:
+					for dockerId := range logMap {
+						d.logChan <- log{
+							dockerId,
+							-1,
 						}
 					}
-
-				}, "data")
-
-				if next, _ := jsonparser.GetString(labelsBytes, "pagination", "next"); next != "" {
-					labelsScrapAddress = next
-				} else {
-					glog.Debugln("<end> get labels:", labelsScrapAddress)
+				case <-d.stopChan:
 					break
 				}
 			}
+		}()
 
-			mutex.Unlock()
+		for l := range d.logChan {
+			newValue := 1
+			if oldValue, ok := logMap[l.id]; ok {
+				newValue = oldValue + l.op
+			}
+			logMap[l.id] = newValue
+
+			if newValue <= 0 {
+				delete(logMap, l.id)
+			} else if newValue > d.limit {
+				go func(dockerId string, op int) {
+					hc := newHttpClient(cattleAccessKey, cattleSecretKey, 60*time.Second)
+
+					instancesBytes, err := hc.get(cattleAddress + "/instances?externalId=" + dockerId)
+					if err != nil {
+						glog.Errorln("cannot get instance by", dockerId, err)
+						return
+					}
+
+					servicesAddress, _ := jsonparser.GetString(instancesBytes, "data", "[0]", "links", "services")
+					if servicesAddress == "" {
+						return
+					}
+					servicesBytes, err := hc.get(servicesAddress)
+					if err != nil {
+						glog.Errorln("cannot get service by", servicesAddress, err)
+						return
+					}
+
+					jsonparser.ArrayEach(servicesBytes, func(serviceBytes []byte, dataType jsonparser.ValueType, offset int, err error) {
+						deactivateAction, _ := jsonparser.GetString(serviceBytes, "actions", "deactivate")
+						if deactivateAction != "" {
+							statusCode, _ := hc.post(deactivateAction, bytes.NewBufferString("{}"))
+
+							if statusCode == http.StatusAccepted {
+								glog.Infoln("stop the service of docker", dockerId)
+							}
+						}
+					}, "data")
+
+					d.logChan <- log{
+						dockerId,
+						-newValue,
+					}
+
+				}(l.id, newValue)
+			}
+		}
+	}()
+
+	return d
+}
+
+var (
+	d    *daily
+	conn *websocket.Conn
+)
+
+func Start(cattleAddress, cattleAccessKey, cattleSecretKey, ignoreLabel string, intolerableInterval, tolerableCounts int) error {
+	glog := utils.GetGlobalLogger()
+
+	// create daily
+	d = newDaily(cattleAddress, cattleAccessKey, cattleSecretKey, tolerableCounts, time.Duration(intolerableInterval)*time.Second)
+
+	// create dialer
+	conn = newWebsocketConn(cattleAddress, cattleAccessKey, cattleSecretKey)
+
+	// watching
+	for {
+		_, messageBytes, err := conn.ReadMessage()
+		if err != nil {
+			glog.Warnln(err)
+			break
+		}
+
+		if resourceType, _ := jsonparser.GetString(messageBytes, "resourceType"); resourceType == "container" {
+			resourceBytes, _, _, err := jsonparser.Get(messageBytes, "data", "resource")
+			if err != nil {
+				continue
+			}
+
+			if state, _ := jsonparser.GetString(resourceBytes, "state"); state == "stopped" {
+				if val, err := jsonparser.GetString(resourceBytes, "labels", ignoreLabel); val != "true" || err == jsonparser.KeyPathNotFoundError {
+					dockerId, _ := jsonparser.GetString(resourceBytes, "externalId")
+					d.record(dockerId)
+				}
+
+			}
 		}
 	}
 
@@ -262,7 +245,13 @@ func Start(cattleAddress, cattleAccessKey, cattleSecretKey, watchLabel string) e
 }
 
 func Stop() error {
-	close(stopChan)
+	if conn != nil {
+		conn.Close()
+	}
+
+	if d != nil {
+		d.close()
+	}
 
 	return nil
 }

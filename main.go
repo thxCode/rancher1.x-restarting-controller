@@ -18,7 +18,10 @@ var (
 	cattleAccessKey string
 	cattleSecretKey string
 	logLevel        string
-	watchLabel      string
+
+	tolerableCounts     int
+	intolerableInterval int
+	ignoreLabel         string
 )
 
 func main() {
@@ -51,15 +54,29 @@ func main() {
 			Name:        "log_level",
 			Usage:       "Set the logging level",
 			EnvVar:      "LOG_LEVEL",
-			Value:       "info",
+			Value:       "debug",
 			Destination: &logLevel,
 		},
+		cli.IntFlag{
+			Name:        "intolerable_interval",
+			Usage:       "How many seconds can not be tolerated",
+			EnvVar:      "INTOLERABLE_INTERVAL",
+			Value:       300,
+			Destination: &intolerableInterval,
+		},
+		cli.IntFlag{
+			Name:        "tolerable_counts",
+			Usage:       "The number of restarts that can be tolerated in an interval that can not be tolerated",
+			EnvVar:      "TOLERABLE_COUNTS",
+			Value:       3,
+			Destination: &tolerableCounts,
+		},
 		cli.StringFlag{
-			Name:        "watch_label",
-			Usage:       "Set the watching label name",
-			EnvVar:      "WATCH_LABEL",
-			Value:       "io.rancher.controller.stop_when_restarting",
-			Destination: &watchLabel,
+			Name:        "ignore_label",
+			Usage:       "Set the ignoring label",
+			EnvVar:      "IGNORE_LABEL",
+			Value:       "io.rancher.restarting_controller.ignore",
+			Destination: &ignoreLabel,
 		},
 	}
 
@@ -93,10 +110,9 @@ func appAction(c *cli.Context) {
 			close(doneChan)
 		}()
 
-		if err := controller.Start(cattleURL, cattleAccessKey, cattleSecretKey, watchLabel); err != nil && err != http.ErrServerClosed {
+		if err := controller.Start(cattleURL, cattleAccessKey, cattleSecretKey, ignoreLabel, intolerableInterval, tolerableCounts); err != nil && err != http.ErrServerClosed {
 			panic(err)
 		}
-
 	}()
 
 	glog.Infoln("Starting rancher-restarting-controller")

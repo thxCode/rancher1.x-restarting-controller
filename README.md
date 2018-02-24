@@ -14,7 +14,9 @@ A controller of Rancher1.x to manage the restart action of container.
 
 ## How to use this image
 
-By default, this controller uses a label named "io.rancher.controller.stop_when_restarting" to manage the restarting count of containers. For example, when creating a "Service" on Rancher, you can set `io.rancher.controller.stop_when_restarting=3` on "Labels". If one of those containers of the "Service" has been restarted over `3` times, the "Service" will be stopped.
+- This controller is deployed on each "Environment" (as same as "Infrastructure") and labeled by `io.rancher.container.create_agent=true, io.rancher.container.agent.role=environment`, it will detect the `stopped` status of each "Container".
+- By default, this controller have `300` intolerable seconds, which means it can allow one "Container" to be restarted below `3` times during the 300 seconds.
+- If one "Container" has been labeled by `io.rancher.restarting_controller.ignore=true`, this controller will never manage it.
 
 ### Running parameters
 
@@ -32,14 +34,15 @@ COMMANDS:
      help, h  Shows a list of commands or help for one command
 
 GLOBAL OPTIONS:
-  --cattle_url value         The URL of Rancher Server API, e.g. http://127.0.0.1:8080 [$CATTLE_URL]
-  --cattle_access_key value  The access key for Rancher API [$CATTLE_ACCESS_KEY]
-  --cattle_secret_key value  The secret key for Rancher API [$CATTLE_SECRET_KEY]
-  --log_level value          Set the logging level (default: "info") [$LOG_LEVEL]
-  --watch_label value        Set the watching label name (default: "io.rancher.controller.stop_when_restarting") [$WATCH_LABEL]
-  --help, -h                 show help
-  --version, -v              print the version
-
+ --cattle_url value            The URL of Rancher Server API, e.g. http://127.0.0.1:8080 [$CATTLE_URL]
+ --cattle_access_key value     The access key for Rancher API [$CATTLE_ACCESS_KEY]
+ --cattle_secret_key value     The secret key for Rancher API [$CATTLE_SECRET_KEY]
+ --log_level value             Set the logging level (default: "debug") [$LOG_LEVEL]
+ --intolerable_interval value  How many seconds can not be tolerated (default: 300) [$INTOLERABLE_INTERVAL]
+ --tolerable_counts value      The number of restarts that can be tolerated in an interval that can not be tolerated (default: 3) [$TOLERABLE_COUNTS]
+ --ignore_label value          Set the ignoring label (default: "io.rancher.restarting_controller.ignore") [$IGNORE_LABEL]
+ --help, -h                    show help
+ --version, -v                 print the version
 
 ```
 
