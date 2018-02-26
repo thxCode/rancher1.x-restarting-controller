@@ -187,6 +187,15 @@ func newDaily(cattleAddress, cattleAccessKey, cattleSecretKey string, limit int,
 							if statusCode == http.StatusAccepted {
 								glog.Infoln("stop the service of docker", dockerId)
 							}
+						} else {
+							cancelupgradeAction, _ := jsonparser.GetString(serviceBytes, "actions", "cancelupgrade")
+							if cancelupgradeAction != "" {
+								statusCode, _ := hc.post(cancelupgradeAction, bytes.NewBufferString("{}"))
+
+								if statusCode == http.StatusAccepted {
+									glog.Infoln("cancel the upgrade of the service of docker", dockerId)
+								}
+							}
 						}
 					}, "data")
 
@@ -231,7 +240,7 @@ func Start(cattleAddress, cattleAccessKey, cattleSecretKey, ignoreLabel string, 
 				continue
 			}
 
-			if state, _ := jsonparser.GetString(resourceBytes, "state"); state == "stopped" {
+			if state, _ := jsonparser.GetString(resourceBytes, "state"); state == "stopped" || state == "error" {
 				if val, err := jsonparser.GetString(resourceBytes, "labels", ignoreLabel); val != "true" || err == jsonparser.KeyPathNotFoundError {
 					dockerId, _ := jsonparser.GetString(resourceBytes, "externalId")
 					d.record(dockerId)
