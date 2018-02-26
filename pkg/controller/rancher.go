@@ -96,26 +96,28 @@ func newWebsocketConn(cattleAddress, cattleAccessKey, cattleSecretKey string) *w
 	return websocketConn
 }
 
-type log struct {
-	id string
-	op int
+type container struct {
+	name      string
+	op        int
+	serviceId string
 }
 
 type daily struct {
-	limit    int
-	logChan  chan log
-	stopChan chan interface{}
+	limit            int
+	containersBuffer chan container
+	stopChan         chan interface{}
 }
 
 func (d *daily) close() {
-	close(d.logChan)
+	close(d.containersBuffer)
 	close(d.stopChan)
 }
 
-func (d *daily) record(dockerId string) {
-	d.logChan <- log{
-		dockerId,
+func (d *daily) record(name string, serviceId string) {
+	d.containersBuffer <- container{
+		name,
 		1,
+		serviceId,
 	}
 }
 
@@ -124,12 +126,12 @@ func newDaily(cattleAddress, cattleAccessKey, cattleSecretKey string, limit int,
 
 	d := &daily{
 		limit,
-		make(chan log, 10),
+		make(chan container, 10),
 		make(chan interface{}),
 	}
 
 	go func() {
-		logMap := make(map[string]int, 32)
+		containersMap := make(map[string]int, 32)
 
 		go func() {
 			ticker := time.NewTicker(intolerableInterval)
@@ -138,10 +140,10 @@ func newDaily(cattleAddress, cattleAccessKey, cattleSecretKey string, limit int,
 			for {
 				select {
 				case <-ticker.C:
-					for dockerId := range logMap {
-						d.logChan <- log{
-							dockerId,
-							-1,
+					for containerName := range containersMap {
+						d.containersBuffer <- container{
+							name: containerName,
+							op:   -1,
 						}
 					}
 				case <-d.stopChan:
@@ -150,42 +152,32 @@ func newDaily(cattleAddress, cattleAccessKey, cattleSecretKey string, limit int,
 			}
 		}()
 
-		for l := range d.logChan {
+		for c := range d.containersBuffer {
 			newValue := 1
-			if oldValue, ok := logMap[l.id]; ok {
-				newValue = oldValue + l.op
+			if oldValue, ok := containersMap[c.name]; ok {
+				newValue = oldValue + c.op
 			}
-			logMap[l.id] = newValue
+			containersMap[c.name] = newValue
 
 			if newValue <= 0 {
-				delete(logMap, l.id)
+				delete(containersMap, c.name)
 			} else if newValue > d.limit {
-				go func(dockerId string, op int) {
-					hc := newHttpClient(cattleAccessKey, cattleSecretKey, 60*time.Second)
+				go func(containerName, serviceId string, op int) {
+					if len(serviceId) != 0 {
+						hc := newHttpClient(cattleAccessKey, cattleSecretKey, 60*time.Second)
 
-					instancesBytes, err := hc.get(cattleAddress + "/instances?externalId=" + dockerId)
-					if err != nil {
-						glog.Errorln("cannot get instance by", dockerId, err)
-						return
-					}
+						serviceBytes, err := hc.get(cattleAddress + "/services/" + serviceId)
+						if err != nil {
+							glog.Errorln("cannot get service info by", serviceId, err)
+							return
+						}
 
-					servicesAddress, _ := jsonparser.GetString(instancesBytes, "data", "[0]", "links", "services")
-					if servicesAddress == "" {
-						return
-					}
-					servicesBytes, err := hc.get(servicesAddress)
-					if err != nil {
-						glog.Errorln("cannot get service by", servicesAddress, err)
-						return
-					}
-
-					jsonparser.ArrayEach(servicesBytes, func(serviceBytes []byte, dataType jsonparser.ValueType, offset int, err error) {
 						deactivateAction, _ := jsonparser.GetString(serviceBytes, "actions", "deactivate")
 						if deactivateAction != "" {
 							statusCode, _ := hc.post(deactivateAction, bytes.NewBufferString("{}"))
 
 							if statusCode == http.StatusAccepted {
-								glog.Infoln("stop the service of docker", dockerId)
+								glog.Infoln("stop the service", serviceId)
 							}
 						} else {
 							cancelupgradeAction, _ := jsonparser.GetString(serviceBytes, "actions", "cancelupgrade")
@@ -193,18 +185,19 @@ func newDaily(cattleAddress, cattleAccessKey, cattleSecretKey string, limit int,
 								statusCode, _ := hc.post(cancelupgradeAction, bytes.NewBufferString("{}"))
 
 								if statusCode == http.StatusAccepted {
-									glog.Infoln("cancel the upgrade of the service of docker", dockerId)
+									glog.Infoln("cancel the upgrading of the service", serviceId)
 								}
 							}
 						}
-					}, "data")
 
-					d.logChan <- log{
-						dockerId,
-						-newValue,
 					}
 
-				}(l.id, newValue)
+					d.containersBuffer <- container{
+						name: containerName,
+						op:   -op,
+					}
+
+				}(c.name, c.serviceId, newValue)
 			}
 		}
 	}()
@@ -242,8 +235,10 @@ func Start(cattleAddress, cattleAccessKey, cattleSecretKey, ignoreLabel string, 
 
 			if state, _ := jsonparser.GetString(resourceBytes, "state"); state == "stopped" || state == "error" {
 				if val, err := jsonparser.GetString(resourceBytes, "labels", ignoreLabel); val != "true" || err == jsonparser.KeyPathNotFoundError {
-					dockerId, _ := jsonparser.GetString(resourceBytes, "externalId")
-					d.record(dockerId)
+					containerName, _ := jsonparser.GetString(resourceBytes, "name")
+					serviceId, _ := jsonparser.GetString(resourceBytes, "serviceIds", "[0]")
+					glog.Debugf("catch info on service %s container %s", serviceId, containerName)
+					d.record(containerName, serviceId)
 				}
 
 			}
